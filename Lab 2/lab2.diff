@@ -1,0 +1,484 @@
+diff --git a/Makefile b/Makefile
+index 09d790c..6f3d512 100644
+--- a/Makefile
++++ b/Makefile
+@@ -181,6 +181,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_lab2test\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+@@ -217,7 +218,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 2
++CPUS := 1
+ endif
+ QEMUOPTS = -drive file=fs.img,index=1,media=disk,format=raw -drive file=xv6.img,index=0,media=disk,format=raw -smp $(CPUS) -m 512 $(QEMUEXTRA)
+ 
+diff --git a/defs.h b/defs.h
+index 82fb982..10fe235 100644
+--- a/defs.h
++++ b/defs.h
+@@ -120,6 +120,12 @@ void            userinit(void);
+ int             wait(void);
+ void            wakeup(void*);
+ void            yield(void);
++//Lab 1
++void            exits(int);
++int             waits(int*);
++int             waitpid(int, int*, int);
++//Lab2
++void            setpriority(int);
+ 
+ // swtch.S
+ void            swtch(struct context**, struct context*);
+diff --git a/exec.c b/exec.c
+index b40134f..fa88bd6 100644
+--- a/exec.c
++++ b/exec.c
+@@ -93,6 +93,13 @@ exec(char *path, char **argv)
+       last = s+1;
+   safestrcpy(curproc->name, last, sizeof(curproc->name));
+ 
++  //Lab2
++  acquire(&tickslock);
++  curproc->start_time = ticks;
++  curproc->burst_time = 0;
++  curproc->last_burst_time = ticks;
++  release(&tickslock);
++
+   // Commit to the user image.
+   oldpgdir = curproc->pgdir;
+   curproc->pgdir = pgdir;
+diff --git a/proc.c b/proc.c
+index 806b1b1..2874d22 100644
+--- a/proc.c
++++ b/proc.c
+@@ -88,6 +88,8 @@ allocproc(void)
+ found:
+   p->state = EMBRYO;
+   p->pid = nextpid++;
++  //Lab2
++  p->priority = 10; //set default priority to 10
+ 
+   release(&ptable.lock);
+ 
+@@ -215,6 +217,8 @@ fork(void)
+   acquire(&ptable.lock);
+ 
+   np->state = RUNNABLE;
++//Lab2
++  np->priority = curproc->priority; //child inherit parent priority
+ 
+   release(&ptable.lock);
+ 
+@@ -319,7 +323,7 @@ wait(void)
+ //  - swtch to start running that process
+ //  - eventually that process transfers control
+ //      via swtch back to the scheduler.
+-void
++/*void
+ scheduler(void)
+ {
+   struct proc *p;
+@@ -353,7 +357,7 @@ scheduler(void)
+     release(&ptable.lock);
+ 
+   }
+-}
++}*/
+ 
+ // Enter scheduler.  Must hold only ptable.lock
+ // and have changed proc->state. Saves and restores
+@@ -532,3 +536,224 @@ procdump(void)
+     cprintf("\n");
+   }
+ }
++
++//Lab 1
++void
++exits(int status)
++{
++    struct proc *curproc = myproc();
++    struct proc *p;
++    int fd;
++
++    curproc->status = status; //different from original exit
++
++    //Lab2
++    int turnaround_time;
++    acquire(&tickslock);
++    turnaround_time = ticks - curproc->start_time;
++    release(&tickslock);
++
++    cprintf("Turnaround Time = %d\n", turnaround_time);
++    cprintf("Waiting Time = %d\n", turnaround_time - curproc->burst_time);
++
++    if(curproc == initproc)
++        panic("init exiting");
++
++    // Close all open files.
++    for(fd = 0; fd < NOFILE; fd++){
++        if(curproc->ofile[fd]){
++            fileclose(curproc->ofile[fd]);
++            curproc->ofile[fd] = 0;
++        }
++    }
++
++    begin_op();
++    iput(curproc->cwd);
++    end_op();
++    curproc->cwd = 0;
++
++    acquire(&ptable.lock);
++
++    // Parent might be sleeping in wait().
++    wakeup1(curproc->parent);
++
++    // Pass abandoned children to init.
++    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++        if(p->parent == curproc){
++            p->parent = initproc;
++            if(p->state == ZOMBIE)
++                wakeup1(initproc);
++        }
++    }
++
++    // Jump into the scheduler, never to return.
++    curproc->state = ZOMBIE;
++    sched();
++    panic("zombie exit");
++}
++
++int
++waits(int *status)
++{
++    struct proc *p;
++    int havekids, pid;
++    struct proc *curproc = myproc();
++
++    acquire(&ptable.lock);
++    for(;;){
++        // Scan through table looking for exited children.
++        havekids = 0;
++        for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++            if(p->parent != curproc)
++                continue;
++            havekids = 1;
++            if(p->state == ZOMBIE){
++                // Found one.
++                pid = p->pid;
++                kfree(p->kstack);
++                p->kstack = 0;
++                freevm(p->pgdir);
++                p->pid = 0;
++                p->parent = 0;
++                p->name[0] = 0;
++                p->killed = 0;
++                p->state = UNUSED;
++                if (status) { //different from original wait
++                    *status = p->status;
++                }
++                release(&ptable.lock);
++                return pid;
++            }
++        }
++
++        // No point waiting if we don't have any children.
++        if(!havekids || curproc->killed){
++            release(&ptable.lock);
++            if (status) { //different from original wait
++                *status = -1;
++            }
++            return -1;
++        }
++
++        // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++        sleep(curproc, &ptable.lock);  //DOC: wait-sleep
++    }
++}
++
++int
++waitpid(int pid, int *status, int options)
++{
++    struct proc *p;
++    int havekids, pidn;
++    struct proc *curproc = myproc();
++
++    acquire(&ptable.lock);
++    for(;;){
++        // Scan through table looking for exited children.
++        havekids = 0;
++        for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++            if (pid == p->pid) {
++                if(p->parent != curproc)
++                    continue;
++                havekids = 1;
++                if(p->state == ZOMBIE){
++                    // Found one.
++                    pidn = p->pid;
++                    kfree(p->kstack);
++                    p->kstack = 0;
++                    freevm(p->pgdir);
++                    p->pid = 0;
++                    p->parent = 0;
++                    p->name[0] = 0;
++                    p->killed = 0;
++                    p->state = UNUSED;
++                    if (status) {
++                        *status = p->status;
++                    }
++                    release(&ptable.lock);
++                    return pidn;
++                }
++                else if (options == 1) {
++                    if (curproc->status >= 0) {
++                        release(&ptable.lock);
++                        return curproc->status;
++                    }
++                    else {
++                        return -1;
++                    }
++                }
++            }
++        }
++        // No point waiting if we don't have any children.
++        if(!havekids || curproc->killed){
++            release(&ptable.lock);
++            return -1;
++        }
++        // Wait for children to exit.  (See wakeup1 call in proc_exit.)
++        sleep(curproc, &ptable.lock);  //DOC: wait-sleep
++    }
++}
++
++//Lab2
++void
++setpriority(int priority)
++{
++    struct proc *p = myproc();
++    p->priority = priority;
++}
++
++void
++scheduler(void)
++{
++    struct proc *p;
++    struct cpu *c = mycpu();
++    c->proc = 0;
++
++    for(;;){
++        // Enable interrupts on this processor.
++        sti();
++
++        // Loop over process table looking for process to run.
++        acquire(&ptable.lock);
++        int maxPriority = 0; //different from original scheduler
++
++        for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
++            if(p->state != RUNNABLE)
++                continue;
++
++            // Switch to chosen process.  It is the process's job
++            // to release ptable.lock and then reacquire it
++            // before jumping back to us.
++            if(p->priority == maxPriority) //different from original scheduler
++            {
++                //Lab2
++                acquire(&tickslock);
++                int current_ticks = ticks;
++                if(current_ticks > p->last_burst_time)
++                {
++                    p->burst_time += 1;
++                    p->last_burst_time = current_ticks;
++                }
++                release(&tickslock);
++
++                c->proc = p;
++                switchuvm(p);
++                p->state = RUNNING;
++
++                swtch(&(c->scheduler), p->context);
++                switchkvm();
++                p->priority += 1; //decrease priority
++
++                // Process is done running for now.
++                // It should have changed its p->state before coming back.
++                c->proc = 0;
++            }
++            else
++            {
++                p->priority -= 1; //increase priority
++            }
++        }
++        release(&ptable.lock);
++
++    }
++}
+\ No newline at end of file
+diff --git a/proc.h b/proc.h
+index 1647114..caff134 100644
+--- a/proc.h
++++ b/proc.h
+@@ -49,6 +49,13 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  //Lab 1
++  int status;
++  //Lab2
++  int priority;
++  int start_time;
++  int burst_time;
++  int last_burst_time;
+ };
+ 
+ // Process memory is laid out contiguously, low addresses first:
+diff --git a/syscall.c b/syscall.c
+index ee85261..b88e5ef 100644
+--- a/syscall.c
++++ b/syscall.c
+@@ -103,6 +103,12 @@ extern int sys_unlink(void);
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++//Lab 1
++extern int sys_exits(void);
++extern int sys_waits(void);
++extern int sys_waitpid(void);
++//Lab2
++extern int sys_setpriority(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +132,12 @@ static int (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++//Lab 1
++[SYS_exits]   sys_exits,
++[SYS_waits]   sys_waits,
++[SYS_waitpid] sys_waitpid,
++//Lab2
++[SYS_setpriority]   sys_setpriority,
+ };
+ 
+ void
+diff --git a/syscall.h b/syscall.h
+index bc5f356..9c0e797 100644
+--- a/syscall.h
++++ b/syscall.h
+@@ -20,3 +20,9 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++//Lab 1
++#define SYS_exits  23
++#define SYS_waits  24
++#define SYS_waitpid  25
++//Lab2
++#define SYS_setpriority 22
+\ No newline at end of file
+diff --git a/sysproc.c b/sysproc.c
+index 0686d29..188b0c1 100644
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -89,3 +89,62 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++//Lab 1
++int
++sys_exits(void) {
++    int status;
++    if (argint(0, &status) < 0) {
++        exits(0);
++    }
++        else {
++        exits(status);
++    }
++        return 0;
++    }
++
++int
++sys_waits(void) {
++    int *status;
++    if (argptr(0, (char**)&status, sizeof(int*) < 0)) {
++        return -1;
++    }
++        return waits(status);
++}
++
++int
++sys_waitpid(void) {
++    int pid;
++    int *status;
++    int options;
++    if (argint(0, &pid) < 0) {
++        return -1;
++    }
++    if (argptr(1, (char**)&status, sizeof(int*) < 0)) {
++        return -1;
++    }
++    if (argint(2, &options) < 0) {
++        return -1;
++    }
++    return waitpid(pid, status, options);
++}
++
++//Lab2
++int
++sys_setpriority(void)
++{
++    int priority;
++
++    if(argint(0, &priority) < 0) //Check lower bound priority
++    {
++        return -1;
++    }
++
++    if(argint(0, &priority) > 31) //Check upper bound priority
++    {
++        return -1;
++    }
++
++    setpriority(priority);
++    return 0;
++}
+\ No newline at end of file
+diff --git a/user.h b/user.h
+index 4f99c52..44be6d5 100644
+--- a/user.h
++++ b/user.h
+@@ -23,6 +23,12 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++//Lab 1
++int exits(int) __attribute__((noreturn));
++int waits(int*);
++int waitpid(int, int*, int);
++//Lab2
++int setpriority(int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/usys.S b/usys.S
+index 8bfd8a1..68c8b90 100644
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,9 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++//Lab 1
++SYSCALL(exits)
++SYSCALL(waits)
++SYSCALL(waitpid)
++//Lab2
++SYSCALL(setpriority)
